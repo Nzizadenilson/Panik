@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0b1736">
+  <title>Panik - Police console</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        onerror="this.onerror=null;this.href='/vendor/leaflet.css'">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo"></span>PANIK <small>Police console</small></div>
+    <div class="devices" id="devices"><span class="dev off"><i></i>No devices seen yet</span></div>
+    <div class="top-actions">
+      <button class="btn ghost small" id="soundBtn" title="Play a sound for new alerts">Sound off</button>
+      <span id="clock"></span>
+    </div>
+  </header>
+  <div class="conn" id="conn" hidden>Connection to the server lost. Retrying...</div>
+
+  <main class="layout">
+    <section class="panel">
+      <!-- list of incidents -->
+      <div id="listView">
+        <nav class="tabs" id="tabs">
+          <button class="tab active" data-tab="active">Active <span class="count" id="c-active">0</span></button>
+          <button class="tab" data-tab="dispatched">Dispatched <span class="count" id="c-dispatched">0</span></button>
+          <button class="tab" data-tab="cancel">Cancels <span class="count" id="c-cancel">0</span></button>
+          <button class="tab" data-tab="history">History <span class="count" id="c-history">0</span></button>
+        </nav>
+        <div class="filters" id="histFilters" hidden>
+          <button class="chip on" data-f="all">All</button>
+          <button class="chip" data-f="dispatched">Dispatched</button>
+          <button class="chip" data-f="accepted">Accepted only</button>
+          <button class="chip" data-f="cancelled">Cancelled</button>
+        </div>
+        <div class="list" id="list"></div>
+      </div>
+      <!-- one incident, with the map focused on it -->
+      <div class="detail" id="detailView" hidden></div>
+    </section>
+
+    <section class="map-wrap">
+      <div id="map"></div>
+      <div class="map-msg" id="mapMsg" hidden></div>
+      <div class="route-panel" id="routePanel" hidden></div>
+    </section>
+  </main>
+
+  <div id="toasts"></div>
+
+  <dialog id="shareDlg">
+    <div class="dlg">
+      <h2>Share live location</h2>
+      <p class="hint" id="shareWhat"></p>
+      <input id="shareUrl" readonly>
+      <div class="grid">
+        <button class="btn dark" id="copyBtn">Copy link</button>
+        <a class="btn green" id="waBtn" target="_blank" rel="noopener">WhatsApp</a>
+        <a class="btn blue" id="smsBtn">SMS</a>
+        <button class="btn" id="nativeShareBtn" hidden>More apps...</button>
+        <a class="btn" id="openLinkBtn" target="_blank" rel="noopener">Open link</a>
+      </div>
+      <p class="hint">Officers who open this link see the vehicle move live on a map, with a button for
+        directions. Their phones must be able to reach this server (same Wi-Fi, or the server hosted online).
+        The link stops updating when the incident is closed.</p>
+      <button class="btn ghost" id="closeDlg">Done</button>
+    </div>
+  </dialog>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>window.L || document.write('<script src="/vendor/leaflet.js"><\/script>')</script>
+  <script src="/js/common.js"></script>
+  <script src="/js/police.js"></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0b1736">
+  <title>Panik - Phone backup</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header class="topbar"><div class="brand"><span class="logo"></span>PANIK <small>Phone backup</small></div></header>
+  <main class="page">
+    <p class="muted">Same alert as the hardware button. 1 press = Level 1, 2 presses within 3 s = Level 2,
+      3 or more = Level 3.</p>
+    <button class="big-btn press" id="press">PRESS</button>
+    <button class="big-btn cancel" id="cancel">CANCEL (hold 5 s)</button>
+    <p class="status" id="status">Ready</p>
+    <p class="muted" id="gps">Waiting for location...</p>
+  </main>
+  <script src="/js/common.js"></script>
+  <script src="/js/phone.js"></script>
+</body>
+</html>

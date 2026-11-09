@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0b1736">
+  <title>Panik - Live location</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        onerror="this.onerror=null;this.href='/vendor/leaflet.css'">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="track-layout">
+    <header class="topbar">
+      <div class="brand"><span class="logo"></span>PANIK <small>Live location for officers</small></div>
+    </header>
+    <div class="ended" id="ended" hidden>This incident has been closed. Tracking has ended.</div>
+    <div class="track-info" id="info">Loading...</div>
+    <div class="track-map">
+      <div id="map"></div>
+      <div class="map-msg" id="mapMsg" hidden></div>
+      <div class="route-panel" id="routePanel" hidden></div>
+    </div>
+    <div class="track-bar three">
+      <button class="btn blue big" id="routeBtn">Route here</button>
+      <a class="btn green big" id="navBtn" target="_blank" rel="noopener">Google Maps</a>
+      <button class="btn dark big" id="centerBtn">Re-centre</button>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>window.L || document.write('<script src="/vendor/leaflet.js"><\/script>')</script>
+  <script src="/js/common.js"></script>
+  <script src="/js/track.js"></script>
+</body>
+</html>
