@@ -1,0 +1,15 @@
+# private settings (Wi-Fi names, passwords, keys)
+esp8266_panik/secrets.h
+.env
+*.env
+!.env.example
+
+# local database (test incidents, driver details) - changes on every run
+panik.db
+
+# Python virtual environment and caches
+panik/
+venv/
+.venv/
+__pycache__/
+*.pyc
