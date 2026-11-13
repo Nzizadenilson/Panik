@@ -9,15 +9,45 @@ import time
 from flask import Flask, request, jsonify
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-DB = os.path.join(BASE, "panik.db")
+
+
+def load_env(path):
+    """Read KEY=value lines from .env into the environment (real environment variables win)."""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        print(f"  ! {name} in .env is not a whole number - using {default}")
+        return default
+
+
+load_env(os.path.join(BASE, ".env"))   # settings: see .env.example
+
+HOST = os.environ.get("PANIK_HOST", "0.0.0.0")
+PORT = env_int("PANIK_PORT", 5000)
+DB = os.path.join(BASE, os.environ.get("PANIK_DB", "panik.db"))   # relative paths are next to server.py
 app = Flask(__name__, static_folder=os.path.join(BASE, "frontend"), static_url_path="")
 
-PORT = 5000
-DRIVER_LOC = {"lat": None, "lng": None, "acc": None, "ts": 0}   # laptop acting as the vehicle GPS
-DRIVER_LOC_MAX_AGE = 30   # s; older than this -> use the location the device sent
-DEVICES = {}              # device_id -> {"ts", "rssi", "src"}
-ONLINE_TIMEOUT = 75       # s without contact -> device offline
-LOST_CONTACT_AFTER = 15   # s without a location update on an open incident -> lost contact
+# Laptop location beacon: the /driver page on the laptop sends its position, and alerts from the
+# board use it (the board has no GPS). Kept in the database, so a server restart does not lose it.
+BEACON_LIVE_S = 30        # a beacon fix newer than this is "live"
+BEACON_LAST_KNOWN_S = 6 * 3600   # older fixes are still used as "last known" for up to 6 hours
+BEACON_MAX_FIX_AGE_S = 60        # the browser's own fix must be newer than this to be accepted
+ONLINE_TIMEOUT = env_int("PANIK_ONLINE_TIMEOUT_S", 75)      # s without contact -> device offline
+REUSE_WINDOW_S = env_int("PANIK_REUSE_WINDOW_S", 300)       # a restarted device continues its open incident
+                                                            # only if it was updated this recently
+LOST_CONTACT_AFTER = env_int("PANIK_LOST_CONTACT_S", 15)    # s without a location update -> lost contact
 # Location cleaning: Wi-Fi/laptop positions jump around by tens of metres even when standing still.
 MIN_MOVE_M = 15           # a new point must be at least this far from the last one to count as movement
 MAX_JITTER_M = 100        # ...or further than its own accuracy, capped at this
@@ -30,7 +60,7 @@ INCIDENT_COLS = {"acknowledged_at": "REAL", "dispatched_at": "REAL", "cancel_at"
 
 # ---------------------------------------------------------------- database
 def db():
-    c = sqlite3.connect(DB)
+    c = sqlite3.connect(DB, timeout=10)   # wait instead of failing if another request is writing
     c.row_factory = sqlite3.Row
     return c
 
@@ -44,6 +74,10 @@ def init():
     CREATE TABLE IF NOT EXISTS locations(
         id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER,
         lat REAL, lng REAL, ts REAL);
+    CREATE TABLE IF NOT EXISTS beacons(
+        device TEXT PRIMARY KEY, lat REAL, lng REAL, acc REAL, manual INTEGER DEFAULT 0, ts REAL);
+    CREATE TABLE IF NOT EXISTS devices(
+        device_id TEXT PRIMARY KEY, ts REAL, rssi INTEGER, src TEXT);
     """)
     have = {r[1] for r in c.execute("PRAGMA table_info(incidents)")}
     for col, typ in INCIDENT_COLS.items():
@@ -55,6 +89,14 @@ def init():
     if "acc" not in loc_cols:
         c.execute("ALTER TABLE locations ADD COLUMN acc REAL")
     c.execute("UPDATE incidents SET closed_at=updated WHERE status='closed' AND closed_at IS NULL")
+    # indexes: the trail of every open incident is read every 2 s, so these lookups must stay fast
+    c.executescript("""
+    CREATE INDEX IF NOT EXISTS idx_locations_incident ON locations(incident_id, id);
+    CREATE INDEX IF NOT EXISTS idx_incidents_device ON incidents(device_id, status);
+    CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status, closed_at);
+    CREATE INDEX IF NOT EXISTS idx_incidents_share ON incidents(share_token);
+    """)
+    c.execute("PRAGMA journal_mode=WAL")   # readers do not block the writer (police console polls a lot)
     c.commit()
     c.close()
 
@@ -102,10 +144,101 @@ def clean_point(c, iid, lat, lng, acc):
     return lat, lng, acc
 
 
-def seen(device_id, **extra):
-    info = DEVICES.setdefault(device_id, {})
-    info.update(extra)
-    info["ts"] = time.time()
+def get_beacon(c, device_id):
+    """The beacon paired with this device, else the shared one ('*'). None if there is none."""
+    return (c.execute("SELECT * FROM beacons WHERE device=?", (device_id,)).fetchone()
+            or c.execute("SELECT * FROM beacons WHERE device='*'").fetchone())
+
+
+def beacon_location(c, device_id, now):
+    """(lat, lng, acc, src) from the laptop beacon, or None. src: laptop / manual / laptop_last."""
+    b = get_beacon(c, device_id)
+    if not b or now - b["ts"] > BEACON_LAST_KNOWN_S:
+        return None
+    if b["manual"]:
+        src = "manual"
+    elif now - b["ts"] <= BEACON_LIVE_S:
+        src = "laptop"
+    else:
+        src = "laptop_last"
+    return b["lat"], b["lng"], b["acc"], src
+
+
+def seen(device_id, rssi=None, src=None):
+    """Remember when a device was last heard from (stored, so a server restart keeps it)."""
+    c = db()
+    c.execute("INSERT INTO devices(device_id,ts,rssi,src) VALUES(?,?,?,?) "
+              "ON CONFLICT(device_id) DO UPDATE SET ts=excluded.ts, "
+              "rssi=COALESCE(excluded.rssi, devices.rssi), src=COALESCE(excluded.src, devices.src)",
+              (device_id, time.time(), rssi, src))
+    c.commit()
+    c.close()
+
+
+# ---------------------------------------------------------------- input checks
+DEVICE_SRCS = ("gps", "phone", "test")   # location sources a device may report itself
+
+
+class BadInput(ValueError):
+    pass
+
+
+def json_body():
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict):
+        raise BadInput("send a JSON object with Content-Type: application/json")
+    return d
+
+
+def clean_device_id(v):
+    v = str(v or "").strip()
+    if not v or len(v) > 20:
+        raise BadInput("device_id is required (1-20 characters)")
+    return v
+
+
+def clean_number(d, key, lo, hi, required=True):
+    v = d.get(key)
+    if v is None or v == "":
+        if required:
+            raise BadInput(f"{key} is required")
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        raise BadInput(f"{key} must be a number")
+    if not math.isfinite(x) or not lo <= x <= hi:
+        raise BadInput(f"{key} must be between {lo} and {hi}")
+    return x
+
+
+def read_alert(d):
+    """Check and normalise an alert from a device. Raises BadInput with a clear message."""
+    try:
+        level = int(float(d.get("level", 1)))
+    except (TypeError, ValueError):
+        raise BadInput("level must be 1, 2 or 3")
+    try:
+        iid = int(d.get("incident_id") or 0)
+    except (TypeError, ValueError):
+        raise BadInput("incident_id must be a number")
+    src = d.get("src", "test")
+    return {
+        "device_id": clean_device_id(d.get("device_id")),
+        "incident_id": max(iid, 0),
+        "level": min(max(level, 1), 3),            # only levels 1-3 exist
+        "cancel": d.get("cancel") in (True, 1, "1", "true", "True"),
+        "lat": clean_number(d, "lat", -90, 90),
+        "lng": clean_number(d, "lng", -180, 180),
+        "acc": clean_number(d, "acc", 0, 100000, required=False),
+        "src": src if src in DEVICE_SRCS else "test",
+        "phone": bool(d.get("phone")),
+    }
+
+
+@app.errorhandler(BadInput)
+def bad_input(e):
+    return jsonify(error=str(e)), 400
 
 
 def lan_ip():
@@ -144,28 +277,30 @@ def track_page(token):
 # ---------------------------------------------------------------- device API (ESP8266 / phone)
 @app.post("/api/heartbeat")
 def heartbeat():
-    d = request.get_json(force=True)
-    seen(d.get("device_id", "?"), rssi=d.get("rssi"), src=d.get("src"))
+    d = json_body()
+    rssi = clean_number(d, "rssi", -150, 0, required=False)
+    seen(clean_device_id(d.get("device_id")), rssi=int(rssi) if rssi is not None else None)
     return jsonify(ok=True)
 
 
 @app.post("/api/alert")
 def alert():
-    d = request.get_json(force=True)
+    d = read_alert(json_body())
     c = db()
     now = time.time()
-    device_id = d.get("device_id", "?")
-    iid = int(d.get("incident_id", 0))
+    device_id = d["device_id"]
+    iid = d["incident_id"]
     row = c.execute("SELECT * FROM incidents WHERE id=? AND device_id=?", (iid, device_id)).fetchone() if iid else None
     if row and row["status"] == "closed":
         c.close()
         seen(device_id)
         return jsonify(closed=True, incident_id=iid)
     if not row:
-        # device restarted and lost its incident id -> continue its open incident instead of a duplicate
-        row = c.execute("SELECT * FROM incidents WHERE device_id=? AND status!='closed' ORDER BY id DESC LIMIT 1",
-                        (device_id,)).fetchone()
-    level = int(d.get("level", 1))
+        # device restarted and lost its incident id -> continue its open incident, but only a recent one;
+        # an old forgotten incident must not swallow a brand-new alert
+        row = c.execute("SELECT * FROM incidents WHERE device_id=? AND status!='closed' AND updated>=? "
+                        "ORDER BY id DESC LIMIT 1", (device_id, now - REUSE_WINDOW_S)).fetchone()
+    level = d["level"]
     if row:
         iid = row["id"]
     else:
@@ -176,12 +311,11 @@ def alert():
     if d.get("cancel"):
         c.execute("UPDATE incidents SET cancel_requested=1, cancel_at=COALESCE(cancel_at,?) WHERE id=?", (now, iid))
 
-    lat, lng = float(d["lat"]), float(d["lng"])
-    src = d.get("src", "test")
-    acc = d.get("acc")
-    if device_id != "PHONE-01" and src != "gps" and DRIVER_LOC["lat"] is not None \
-            and now - DRIVER_LOC["ts"] < DRIVER_LOC_MAX_AGE:
-        lat, lng, src, acc = DRIVER_LOC["lat"], DRIVER_LOC["lng"], "laptop", DRIVER_LOC["acc"]
+    lat, lng, src, acc = d["lat"], d["lng"], d["src"], d["acc"]
+    if not d["phone"] and device_id != "PHONE-01" and src not in ("gps", "phone"):   # board without GPS: use the laptop beacon
+        b = beacon_location(c, device_id, now)
+        if b:
+            lat, lng, acc, src = b
     if src != "test":                       # the simulated test drift is left as it is
         lat, lng, acc = clean_point(c, iid, lat, lng, acc)
     c.execute("INSERT INTO locations(incident_id,lat,lng,ts,src,acc) VALUES(?,?,?,?,?,?)",
@@ -194,15 +328,45 @@ def alert():
 
 @app.post("/api/driver_location")
 def driver_location():
-    d = request.get_json(force=True)
+    """Position from the laptop's /driver page.
+    Body: lat, lng, acc (m), fix_age (s since the browser got the fix), device (optional), manual (bool)."""
+    d = json_body()
     now = time.time()
-    acc = float(d["acc"]) if d.get("acc") is not None else None
-    old = DRIVER_LOC
+    lat = clean_number(d, "lat", -90, 90)
+    lng = clean_number(d, "lng", -180, 180)
+    device = str(d.get("device") or "*").strip().upper()[:20] or "*"
+    manual = bool(d.get("manual"))
+    acc = clean_number(d, "acc", 0, 100000, required=False)
+    if acc is None and manual:
+        acc = 10.0
+    fix_age = clean_number(d, "fix_age", -3600, 10 ** 9, required=False) or 0
+    if not manual and fix_age > BEACON_MAX_FIX_AGE_S:
+        return jsonify(ok=True, used=False, reason="old fix")      # the browser kept re-sending an old position
+    c = db()
+    old = c.execute("SELECT * FROM beacons WHERE device=?", (device,)).fetchone()
     # skip a much worse reading while a recent, better one exists (Wi-Fi location sometimes jumps far away)
-    if acc and old["acc"] and now - old["ts"] < 20 and acc > BAD_ACC_M and acc > 2 * old["acc"]:
-        return jsonify(ok=True, used=False)
-    DRIVER_LOC.update(lat=float(d["lat"]), lng=float(d["lng"]), acc=acc, ts=now)
-    return jsonify(ok=True, used=True)
+    if (not manual and old and not old["manual"] and acc and old["acc"] and now - old["ts"] < 20
+            and acc > BAD_ACC_M and acc > 2 * old["acc"]):
+        c.close()
+        return jsonify(ok=True, used=False, reason="worse than the last reading")
+    c.execute("INSERT INTO beacons(device,lat,lng,acc,manual,ts) VALUES(?,?,?,?,?,?) "
+              "ON CONFLICT(device) DO UPDATE SET lat=excluded.lat, lng=excluded.lng, acc=excluded.acc, "
+              "manual=excluded.manual, ts=excluded.ts", (device, lat, lng, acc, int(manual), now))
+    c.commit()
+    c.close()
+    return jsonify(ok=True, used=True, device=device)
+
+
+@app.post("/api/driver_location/stop")
+def driver_location_stop():
+    """Forget the beacon (e.g. when the laptop page is closed or a manual pin is cleared)."""
+    d = request.get_json(silent=True) or {}
+    device = str(d.get("device") or "*").strip().upper() or "*"
+    c = db()
+    c.execute("DELETE FROM beacons WHERE device=?", (device,))
+    c.commit()
+    c.close()
+    return jsonify(ok=True)
 
 
 # ---------------------------------------------------------------- police API
@@ -216,8 +380,12 @@ def state():
                           "ORDER BY closed_at DESC, id DESC LIMIT 100").fetchall()
     out = {
         "server_time": now,
-        "devices": [{"device_id": k, "ago": int(now - v["ts"]), "online": now - v["ts"] < ONLINE_TIMEOUT,
-                     "rssi": v.get("rssi")} for k, v in sorted(DEVICES.items())],
+        "devices": [{"device_id": v["device_id"], "ago": int(now - v["ts"]), "online": now - v["ts"] < ONLINE_TIMEOUT,
+                     "rssi": v["rssi"]} for v in c.execute("SELECT * FROM devices ORDER BY device_id")],
+        "beacons": [{"device": b["device"], "ago": int(now - b["ts"]), "manual": bool(b["manual"]),
+                     "live": bool(b["manual"]) or now - b["ts"] <= BEACON_LIVE_S,
+                     "acc": round(b["acc"]) if b["acc"] is not None else None}
+                    for b in c.execute("SELECT * FROM beacons ORDER BY device")],
         "open": [incident_dict(c, r, now) for r in open_rows],
         "history": [incident_dict(c, r, now, trail_limit=0) for r in hist_rows],
     }
@@ -305,4 +473,5 @@ if __name__ == "__main__":
     print(f"\n  Police console:  http://localhost:{PORT}/   (other devices: http://{lan_ip()}:{PORT}/)")
     print(f"  Phone backup:    http://{lan_ip()}:{PORT}/phone")
     print(f"  Laptop GPS:      http://localhost:{PORT}/driver\n")
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    print(f"  Database:        {DB}\n")
+    app.run(host=HOST, port=PORT, threaded=True)

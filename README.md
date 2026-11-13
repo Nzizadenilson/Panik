@@ -1,60 +1,106 @@
 # Panik: discreet emergency button (prototype)
 
+A driver presses a hidden button; the police console shows the alert, the vehicle's location and its
+urgency level (1-3) at once. Repeated presses raise the level, holding the button for 5 s sends a
+cancel request, and only the police can close an incident.
+
 ```
 Panik/
-  server.py              Flask API only (alerts, incidents, history, share links)
-  panik_esp8266.ino      NodeMCU / ESP8266 button firmware (unchanged API)
-  panik.db               created automatically (SQLite)
+  server.py                Flask API: alerts, incidents, history, share links, laptop location beacon
+  requirements.txt         Python packages (Flask)
+  .env.example             server settings; copy to .env (ignored by git)
+  esp8266_panik/
+    esp8266_panik.ino      NodeMCU / ESP8266 firmware
+    secrets.example.h      template for secrets.h (plate, Wi-Fi networks, server address)
+    secrets.h              your own copy - ignored by git, never commit it
   frontend/
-    index.html           Police console
-    track.html           Live-location page for officers on the ground (shared link)
-    phone.html           Phone backup panic button
-    driver.html          Laptop acting as the vehicle GPS
-    css/style.css        Shared styles (responsive: laptop + phone)
-    js/common.js         Shared helpers
-    js/police.js         Police console logic
-    js/track.js  js/phone.js  js/driver.js
-    vendor/              (optional) offline copy of Leaflet, see below
+    index.html             police console
+    track.html             live location for officers on the ground (shared link)
+    phone.html             phone backup panic button
+    driver.html            laptop location beacon (the board has no GPS)
+    css/style.css          shared styles (laptop + phone)
+    js/                    common.js, police.js, track.js, phone.js, driver.js
+    vendor/                optional offline copy of Leaflet (see Notes)
+  panik.db                 SQLite database, created automatically - ignored by git
 ```
 
-## Run
+## 1. Server setup (first time)
 
 ```bash
-pip install flask
-python server.py
+cd Panik
+python3 -m venv .venv                 # virtual environment (ignored by git)
+source .venv/bin/activate             # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env                  # optional: change port, database file, timings
 ```
 
-The terminal prints the addresses. Then:
+## 2. Device setup (first time)
+
+Hardware (Menya IoT kit + NodeMCU ESP8266):
+
+| Part | Connection |
+|---|---|
+| Push button module | D -> **D7**, VCC -> **3V3**, GND -> **G** |
+| LED module (optional) | LED3 green -> **D1**, LED2 yellow -> **D2**, LED1 red -> **D0**, GND -> **G** |
+
+Turn parts on or off with `USE_KIT_BUTTON` / `USE_LED_MODULE` at the top of the `.ino`.
+The NodeMCU's own **FLASH** button always works as a backup button.
+
+1. Arduino IDE -> Boards Manager: **esp8266**. Board: **NodeMCU 1.0 (ESP-12E Module)**.
+2. Arduino IDE -> Library Manager: **ArduinoJson** by Benoit Blanchon, version **7.x**.
+3. In `esp8266_panik/`, copy `secrets.example.h` to `secrets.h` and fill in:
+   - `DEVICE_ID`: the vehicle plate shown to the police (each board its own),
+   - `WIFI_NETWORKS`: one line per Wi-Fi the board may use, each with the **laptop's IP on that network**
+     (`ip a` on the laptop while it is on that network), e.g. hostel Wi-Fi and a phone hotspot.
+4. Upload `esp8266_panik/esp8266_panik.ino`. Serial Monitor at 115200 shows its IP and the server it uses.
+
+## 3. Run
+
+```bash
+source .venv/bin/activate
+python server.py
+```
 
 | Who | Open |
 |---|---|
 | Police (laptop) | `http://localhost:5000/` |
 | Police (phone, same Wi-Fi) | `http://<laptop-ip>:5000/` |
-| Laptop as vehicle GPS | `http://localhost:5000/driver` (must be `localhost`) |
+| Laptop location beacon | `http://localhost:5000/driver` in **Firefox** (must be `localhost`) |
 | Phone backup button | `http://<laptop-ip>:5000/phone` |
+| Board's own button page | `http://<board-ip>/` (printed in the Serial Monitor) |
 
-Your old `panik.db` keeps working: the new columns are added automatically.
+The database upgrades itself when new columns or tables are added.
+
+## Using the board
+
+| You do | Result |
+|---|---|
+| Tap | alert, level 1 |
+| 2 / 3 taps within 3 s | level 2 / level 3 (the level never goes down) |
+| Hold 5 s | cancel request: the police verify with the driver, then close |
+| Police close the incident | board returns to standby |
+
+LEDs: green / +yellow / +red = level 1 / 2 / 3; blinking = cancel requested.
+Blue LED blinking fast = no Wi-Fi (presses are kept and sent once connected).
+
+## Laptop location beacon
+
+The board has no GPS, so its alerts use the laptop's position from the `/driver` page.
+
+- **LIVE** - sending the laptop's location (Wi-Fi based, about 20-200 m accurate).
+- **Set position on the map** - click where the vehicle is; exact, best for demos. Use this if the
+  browser cannot locate (common in Brave/Chromium on Linux).
+- If the page stops, alerts use the **last known** position (up to 6 h), labelled as such.
+- "Used for vehicle" pairs the beacon with one plate; empty = any board.
 
 ## Using the police console
 
-- **Tabs:** *Active* (new + accepted), *Dispatched*, *Cancels* (driver held CANCEL, needs verifying),
-  *History* (closed). Several incidents at once each sit in their own tab, newest/most urgent first.
-- **Accept & track:** accepts the alert and opens the map focused on that vehicle, following it live.
-- **Dispatch unit:** moves the incident to *Dispatched*.
-- **Share live location:** creates a secret link (WhatsApp, SMS, copy) that officers on the ground open
-  on their phone to follow the vehicle and get directions. The link stops updating when the incident is closed.
-- **Close incident:** *resolved*, or for cancel requests *driver verified safe - close as cancelled*.
-  Closed incidents go to *History*, which shows whether each one was accepted, dispatched or cancelled
-  (filter chips at the top), with the full timeline and route.
-- **Map views:** the switcher at the top-right of the map changes between *Streets*, *Satellite* and
-  *Hybrid* (satellite + road names). The choice is remembered.
-- **Directions:** shows the road route, distance and drive time from the unit to the vehicle, and updates
-  it as the vehicle moves. The start is your location when the browser allows it; otherwise tap the map
-  (e.g. the police station). *Google Maps* opens turn-by-turn navigation.
-- **Route on roads:** the vehicle's path is snapped to real roads (OpenStreetMap map matching), so it
-  no longer cuts through buildings. The faint circle around the vehicle is the location accuracy (e.g. ±60 m).
-- **Sound on:** click once to allow alert sounds (browsers block sound until you click).
-- Black flashing card = **LOST CONTACT** (no update for 15 s). Device chips at the top show online/offline.
+- **Tabs:** *Active*, *Dispatched*, *Cancels* (needs verifying), *History* (closed, with filters).
+- **Accept & track** opens the map on that vehicle and follows it. **Dispatch unit**, **Close incident**.
+- **Share live location:** secret link (WhatsApp, SMS, copy) for officers on the ground.
+- **Map:** Streets / Satellite / Hybrid, road directions with drive time, route snapped to roads.
+- **Sound on:** click once to allow alert sounds.
+- Black flashing card = **LOST CONTACT**. Top bar: devices online/offline and the beacon status.
 
 ## Test without hardware
 
@@ -62,22 +108,26 @@ Your old `panik.db` keeps working: the new columns are added automatically.
 curl -X POST http://localhost:5000/api/alert -H "Content-Type: application/json" \
  -d '{"device_id":"TEST-1","incident_id":0,"level":3,"lat":-1.9441,"lng":30.0619,"src":"test"}'
 ```
-A single curl shows LOST CONTACT after 15 s because nothing else is sent; that is expected.
-Use the phone page (`/phone`) for a continuous test alert.
+Bad input gets a clear `400` error (e.g. `{"error": "lat is required"}`). A single curl shows LOST CONTACT
+after 15 s because nothing else is sent; use `/phone` for a continuous test alert.
 
-## Location accuracy
+## Contributing
 
-Laptop (Wi-Fi) location is only accurate to about 20-200 m and wanders even when you stand still.
-The server holds the last position until a new reading moves further than its accuracy (min 15 m,
-max 100 m), and skips readings much worse than a recent good one. For real accuracy (3-10 m) use a
-GPS module (NEO-6M) or the phone's GPS over https.
+- **Never commit** `secrets.h`, `.env` or `panik.db` (they are in `.gitignore`). Check `git status` first.
+- One change per commit, with a message that says what and why, in the imperative:
+  - `Add 3-second window for raising the alert level`
+  - `Fix board freezing when the server is unreachable`
+  - `Update README with secrets.h setup`
+- Not: `updated`, `changes`, `Update panik.db with latest changes`.
 
 ## Notes
 
 - **Share links** use the laptop's Wi-Fi address, so officers' phones must be on the same network.
-  To share with anyone, host the server online (Render, PythonAnywhere...) - that also gives https,
-  which lets the phone page use the phone's real GPS.
+  Hosting the server online (PythonAnywhere, Render...) makes links work anywhere and gives https,
+  which lets phones use their real GPS.
 - **Satellite/Hybrid** imagery is from Esri and routing from the public OSRM server (free, fair use, no key).
-- **Map needs internet** (Leaflet from unpkg.com and OpenStreetMap tiles). If unpkg is blocked, download
-  `leaflet.js` and `leaflet.css` from https://unpkg.com/leaflet@1.9.4/dist/ into `frontend/vendor/`;
-  the pages fall back to that copy automatically. Alerts work even when the map cannot load.
+- **The map needs internet.** If unpkg.com is blocked, put `leaflet.js` and `leaflet.css` from
+  https://unpkg.com/leaflet@1.9.4/dist/ in `frontend/vendor/`; the pages fall back to them.
+  Alerts work even when the map cannot load.
+- **Prototype limits:** no police login yet, location is from the laptop (no GPS module), and the board
+  accepts the server's https certificate without checking it.
